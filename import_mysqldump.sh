@@ -2,16 +2,20 @@
 #
 # import_sql.sh
 #
-# Le todos os arquivos .sql do diretorio atual (gerados por mysqldump,
-# um por tabela), ordena por tamanho em ordem crescente e importa
-# cada um para o banco de dados informado.
+# Le arquivos .sql de um diretorio (por padrao, o diretorio atual; gerados
+# por mysqldump, um por tabela, ja com DROP TABLE IF EXISTS + CREATE TABLE
+# + INSERTs), ordena por tamanho em ordem crescente e importa cada um para
+# o banco de dados informado. Como cada arquivo ja tem o DROP/CREATE, cada
+# tabela e apagada e recriada so de importar; FOREIGN_KEY_CHECKS fica
+# desligado durante a importacao para o DROP nao esbarrar em FK de outra
+# tabela (ex: uma tabela pivo que referencia outra do mesmo dump).
 #
 # Uso:
-#   ./import_sql.sh -d nome_do_banco [-h host] [-P porta] [-u usuario] [-p]
+#   ./import_sql.sh -d nome_do_banco [-f diretorio] [-h host] [-P porta] [-u usuario] [-p]
 #
 # Exemplos:
 #   ./import_sql.sh -d meubanco
-#   ./import_sql.sh -d meubanco -h 127.0.0.1 -P 3306 -u root -p
+#   ./import_sql.sh -d meubanco -f ./dump_roles -h 127.0.0.1 -P 3306 -u root -p
 #
 # Se -p for passado sem senha, o script pedira a senha de forma interativa
 # (nao aparece no historico do shell nem no `ps`).
@@ -19,6 +23,7 @@
 set -euo pipefail
 
 DB=""
+DUMP_DIR="."
 DB_HOST="localhost"
 DB_PORT="3306"
 DB_USER="root"
@@ -26,13 +31,14 @@ ASK_PASS="false"
 MYSQL_PASS=""
 
 usage() {
-    echo "Uso: $0 -d <banco> [-h <host>] [-P <porta>] [-u <usuario>] [-p]"
+    echo "Uso: $0 -d <banco> [-f <diretorio>] [-h <host>] [-P <porta>] [-u <usuario>] [-p]"
     exit 1
 }
 
-while getopts "d:h:P:u:p" opt; do
+while getopts "d:f:h:P:u:p" opt; do
     case "$opt" in
         d) DB="$OPTARG" ;;
+        f) DUMP_DIR="$OPTARG" ;;
         h) DB_HOST="$OPTARG" ;;
         P) DB_PORT="$OPTARG" ;;
         u) DB_USER="$OPTARG" ;;
@@ -44,6 +50,11 @@ done
 if [[ -z "$DB" ]]; then
     echo "Erro: informe o banco de dados com -d <banco>"
     usage
+fi
+
+if [[ ! -d "$DUMP_DIR" ]]; then
+    echo "Erro: diretorio '$DUMP_DIR' nao existe"
+    exit 1
 fi
 
 if [[ "$ASK_PASS" == "true" ]]; then
@@ -66,11 +77,11 @@ if ! mysql "${MYSQL_ARGS[@]}" -e "USE \`$DB\`;" 2>/tmp/mysql_check_err; then
 fi
 rm -f /tmp/mysql_check_err
 
-# Lista os arquivos .sql do diretorio atual ordenados por tamanho crescente
-mapfile -t FILES < <(find . -maxdepth 1 -type f -iname "*.sql" -printf '%s %p\n' | sort -n | cut -d' ' -f2-)
+# Lista os arquivos .sql do diretorio ordenados por tamanho crescente
+mapfile -t FILES < <(find "$DUMP_DIR" -maxdepth 1 -type f -iname "*.sql" -printf '%s %p\n' | sort -n | cut -d' ' -f2-)
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
-    echo "Nenhum arquivo .sql encontrado no diretorio atual."
+    echo "Nenhum arquivo .sql encontrado em '$DUMP_DIR'."
     exit 0
 fi
 
@@ -95,7 +106,11 @@ for f in "${FILES[@]}"; do
     inicio=$(date +%s)
     echo -n "Importando $nome ... "
 
-    if mysql "${MYSQL_ARGS[@]}" "$DB" < "$f" >>"$LOG_FILE" 2>&1; then
+    if {
+        echo "SET FOREIGN_KEY_CHECKS=0;"
+        cat "$f"
+        echo "SET FOREIGN_KEY_CHECKS=1;"
+    } | mysql "${MYSQL_ARGS[@]}" "$DB" >>"$LOG_FILE" 2>&1; then
         fim=$(date +%s)
         echo "OK ($(( fim - inicio ))s)"
         OK=$((OK + 1))
