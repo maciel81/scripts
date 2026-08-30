@@ -197,9 +197,9 @@ PECL_EXTENSIONS="${PECL_EXTENSIONS_INPUT:-}"
 
 if [ -n "$EXTRA_EXTENSIONS" ]; then
     warn "Algumas extensões precisam de uma lib do sistema além da toolchain já"
-    warn "instalada (ex: 'intl' exige libicu-dev, 'gmp' exige libgmp-dev, 'ldap'"
-    warn "exige libldap2-dev) — se 'docker build' falhar reclamando de pkg-config,"
-    warn "adicione a lib que faltar na lista de apt-get install do Dockerfile."
+    warn "instalada (ex: 'intl' exige libicu-dev, 'gmp' exige libgmp-dev; 'ldap'"
+    warn "já é tratado automaticamente pelo script) — se 'docker build' falhar"
+    warn "reclamando de pkg-config, adicione a lib que faltar no Dockerfile."
 fi
 
 # Monta a linha de extensões extras (se houver) já com a quebra/continuação
@@ -209,6 +209,18 @@ EXTRA_EXT_LINE=""
 if [ -n "$EXTRA_EXTENSIONS" ]; then
     EXTRA_EXT_LINE=$'\n'"        ${EXTRA_EXTENSIONS} \\"
 fi
+
+# 'ldap' precisa de libldap2-dev e de uma flag de configure específica — sem
+# "--with-libdir", o link falha nessa imagem base (multiarch do Debian).
+# Validado manualmente: sem essa flag o build quebra em "cannot find -lldap".
+LDAP_APT_LINE=""
+LDAP_CONFIGURE_LINE=""
+case " $EXTRA_EXTENSIONS " in
+    *" ldap "*)
+        LDAP_APT_LINE=$'\n'"        libldap2-dev \\"
+        LDAP_CONFIGURE_LINE=$'\n'"    && docker-php-ext-configure ldap --with-libdir=lib/\$(uname -m)-linux-gnu/ \\"
+        ;;
+esac
 
 PECL_BLOCK=""
 if [ -n "$PECL_EXTENSIONS" ]; then
@@ -221,6 +233,11 @@ if [ -n "$PECL_EXTENSIONS" ]; then
 fi
 
 DOCKERFILE="docker/Dockerfile"
+if [ -f "$DOCKERFILE" ]; then
+    FIRST_INSTALL=0
+else
+    FIRST_INSTALL=1
+fi
 if [ ! -f "$DOCKERFILE" ]; then
     info "Criando ${DOCKERFILE}..."
     cat > "$DOCKERFILE" <<EOF
@@ -236,11 +253,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
         libfreetype6-dev \\
         libzip-dev \\
         libxml2-dev \\
-        libonig-dev \\
+        libonig-dev \\${LDAP_APT_LINE}
         unzip \\
         git \\
         curl \\
-    && docker-php-ext-configure gd --with-freetype --with-jpeg \\
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \\${LDAP_CONFIGURE_LINE}
     && docker-php-ext-install -j\$(nproc) \\
         gd \\
         mysqli \\
@@ -423,7 +440,7 @@ fi
 # ------------------------------ Integração Traefik --------------------------
 # Opcional: acesso por domínio (http://projeto.localhost) em vez de porta.
 
-if ask_yes_no "Configurar acesso via domínio (Traefik) em vez de porta (ex: http://${PROJECT}.localhost)?" "n"; then
+if ask_yes_no "Configurar acesso via domínio (Traefik) em vez de porta (ex: http://${PROJECT}.localhost)?" "s"; then
 
     TRAEFIK_DIR="$HOME/traefik"
 
@@ -501,15 +518,40 @@ EOF
     fi
 else
     info "Pulando integração com Traefik (acesso continuará via porta, ex: http://localhost:8080)."
+    # Se uma execução anterior tinha configurado Traefik, o .env pode ter
+    # COMPOSE_FILE apontando para docker-compose.override.yml — sem esse
+    # arquivo (não recriado nesta execução), o 'docker compose build' quebra
+    # com "stat docker-compose.override.yml: no such file or directory".
+    if [ -f .env ] && grep -q '^COMPOSE_FILE=' .env; then
+        warn "Removendo COMPOSE_FILE do .env (apontava para docker-compose.override.yml,"
+        warn "que não existe nesta execução sem Traefik)."
+        grep -v '^COMPOSE_FILE=' .env > .env.tmp || true
+        mv .env.tmp .env
+    fi
+    if [ -f docker-compose.override.yml ]; then
+        warn "docker-compose.override.yml já existe de uma execução anterior com"
+        warn "Traefik — o 'docker compose' o combina automaticamente por convenção,"
+        warn "mesmo sem COMPOSE_FILE no .env. Apague o arquivo se quiser voltar a"
+        warn "acessar só por porta."
+    fi
 fi
 
 # --------------------------------- Build / Up --------------------------------
+# Numa instalação nova (Dockerfile acabou de ser criado), 'docker compose
+# up -d' já builda sozinho, já que a imagem ainda não existe. Numa reexecução
+# (Dockerfile já existia — ex: você adicionou uma extensão nova a mão), o
+# container pode já estar rodando com a imagem antiga: 'up -d' sozinho não
+# reconstrói nem recria nesse caso, então builda explicitamente e força a
+# recriação do container a partir da imagem nova.
 
-info "Buildando a imagem..."
-docker compose build
-
-info "Subindo os containers..."
-docker compose up -d
+if [ "$FIRST_INSTALL" -eq 1 ]; then
+    info "Primeira instalação — subindo os containers (builda automaticamente)..."
+    docker compose up -d
+else
+    info "Ambiente já existia — reconstruindo a imagem e recriando o container..."
+    docker compose build
+    docker compose up -d --force-recreate
+fi
 
 echo
 ok "Setup concluído para o projeto '${PROJECT}'."
@@ -528,9 +570,19 @@ else
     echo "    Host (de dentro do container): host.docker.internal"
 fi
 echo
-echo "IMPORTANTE: como este sistema não usa .env de aplicação, configure"
-echo "manualmente as credenciais de banco no arquivo de configuração do"
-echo "próprio sistema (ex: config.php), usando os valores gravados em ${ENV_FILE}."
+echo "IMPORTANTE: este sistema não lê .env nem config.php — a app lê as"
+echo "credenciais via variável de ambiente do Apache (SetEnv no .htaccess)."
+echo "Adicione estas linhas ao .htaccess do projeto (AllowOverride All e"
+echo "mod_env já estão habilitados no container):"
+echo
+echo "  SetEnv DB_HOST \"${DB_HOST_VALUE}\""
+echo "  SetEnv DB_NAME \"${DB_NAME}\""
+echo "  SetEnv DB_USER \"${DB_USER}\""
+echo "  SetEnv DB_PASS \"${DB_PASSWORD}\""
+echo
+echo "(confira o nome exato das variáveis que o sistema espera — pode ser"
+echo "diferente de DB_HOST/DB_NAME/DB_USER/DB_PASS; procure por getenv("
+echo "no código-fonte para descobrir os nomes certos.)"
 echo
 if grep -q "traefik.enable=true" docker-compose.override.yml 2>/dev/null; then
     echo "Acesse em: http://${PROJECT}.localhost"
