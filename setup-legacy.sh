@@ -183,6 +183,43 @@ WWWGROUP="$(id -g)"
 # ao longo das versões. O bloco abaixo cobre bem de 7.x a 8.x. Para 5.6, as
 # libs *-dev do Debian atual podem ser incompatíveis; se o build de gd/zip
 # falhar no 5.6, comente essas extensões no Dockerfile e rebuild.
+# Extensões PHP adicionais (além de gd/mysqli/pdo_mysql/mbstring/xml/zip/
+# opcache, que já vêm sempre). Ex: bcmath intl soap gmp — disponíveis via
+# docker-php-ext-install, sem precisar compilar do PECL.
+read -r -p "Alguma extensão PHP adicional (ex: bcmath intl soap), além das padrão? [Enter para nenhuma]: " EXTRA_EXTENSIONS_INPUT
+EXTRA_EXTENSIONS="${EXTRA_EXTENSIONS_INPUT:-}"
+
+# Extensões via PECL: não vêm empacotadas com o PHP, precisam ser compiladas
+# (pecl install + docker-php-ext-enable). Ex.: sistemas legados que leem
+# arquivos .dbf usam a extensão "dbase" do PECL.
+read -r -p "Alguma extensão via PECL (ex: dbase, redis, imagick)? [Enter para nenhuma]: " PECL_EXTENSIONS_INPUT
+PECL_EXTENSIONS="${PECL_EXTENSIONS_INPUT:-}"
+
+if [ -n "$EXTRA_EXTENSIONS" ]; then
+    warn "Algumas extensões precisam de uma lib do sistema além da toolchain já"
+    warn "instalada (ex: 'intl' exige libicu-dev, 'gmp' exige libgmp-dev, 'ldap'"
+    warn "exige libldap2-dev) — se 'docker build' falhar reclamando de pkg-config,"
+    warn "adicione a lib que faltar na lista de apt-get install do Dockerfile."
+fi
+
+# Monta a linha de extensões extras (se houver) já com a quebra/continuação
+# certa, para não deixar linha em branco solta dentro do RUN de baixo — uma
+# continuação "\" seguida de linha vazia gera warning no BuildKit.
+EXTRA_EXT_LINE=""
+if [ -n "$EXTRA_EXTENSIONS" ]; then
+    EXTRA_EXT_LINE=$'\n'"        ${EXTRA_EXTENSIONS} \\"
+fi
+
+PECL_BLOCK=""
+if [ -n "$PECL_EXTENSIONS" ]; then
+    PECL_BLOCK=$'\n'"# Extensões via PECL: algumas precisam de biblioteca do sistema além da"
+    PECL_BLOCK="${PECL_BLOCK}"$'\n'"# toolchain de build já presente na imagem (ex: imagick precisa de"
+    PECL_BLOCK="${PECL_BLOCK}"$'\n'"# libmagickwand-dev via apt-get antes do pecl install) — se o build"
+    PECL_BLOCK="${PECL_BLOCK}"$'\n'"# falhar, adicione a lib que faltar."
+    PECL_BLOCK="${PECL_BLOCK}"$'\n'"RUN pecl install ${PECL_EXTENSIONS} \\"
+    PECL_BLOCK="${PECL_BLOCK}"$'\n'"    && docker-php-ext-enable ${PECL_EXTENSIONS}"
+fi
+
 DOCKERFILE="docker/Dockerfile"
 if [ ! -f "$DOCKERFILE" ]; then
     info "Criando ${DOCKERFILE}..."
@@ -211,8 +248,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
         mbstring \\
         xml \\
         zip \\
-        opcache \\
+        opcache \\${EXTRA_EXT_LINE}
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+${PECL_BLOCK}
 
 # Habilita mod_rewrite (necessário para .htaccess reescrever URLs)
 RUN a2enmod rewrite
@@ -244,6 +282,11 @@ else
         warn "ausente) — arquivos gravados pela aplicação no volume podem ficar com"
         warn "dono incompatível (www-data, uid/gid 33). Considere adicionar manualmente"
         warn "(ver bloco 'RUN usermod/groupmod' gerado para instalações novas)."
+    fi
+    if [ -n "$EXTRA_EXTENSIONS" ] || [ -n "$PECL_EXTENSIONS" ]; then
+        warn "${DOCKERFILE} já existe, então as extensões informadas (${EXTRA_EXTENSIONS} ${PECL_EXTENSIONS}) não foram adicionadas."
+        warn "Adicione manualmente: docker-php-ext-install para extensões padrão, ou"
+        warn "'pecl install <ext> && docker-php-ext-enable <ext>' para extensões PECL."
     fi
 fi
 
