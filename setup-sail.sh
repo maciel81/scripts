@@ -145,7 +145,26 @@ if [ ! -f compose.yaml ] && [ ! -f docker-compose.yml ]; then
     SAIL_FRESH_INSTALL=1
 fi
 
-if ask_yes_no "Instalar MySQL em container Docker? (responda não se já usa um MySQL nativo no host)" "n"; then
+# O banco de dados é sempre perguntado (mysql ou pgsql), independente de
+# rodar em container ou nativo no host — preenche DB_CONNECTION no .env
+# dinamicamente a partir da resposta, em vez de assumir MySQL fixo.
+CURRENT_DB_CONNECTION=""
+[ -f .env ] && CURRENT_DB_CONNECTION="$(grep '^DB_CONNECTION=' .env | head -1 | cut -d= -f2- || true)"
+DB_ENGINE_DEFAULT="${CURRENT_DB_CONNECTION:-mysql}"
+case "$DB_ENGINE_DEFAULT" in
+    mysql|pgsql) ;;
+    *) DB_ENGINE_DEFAULT="mysql" ;;
+esac
+
+read -r -p "Qual banco de dados este projeto usa? (mysql/pgsql) [${DB_ENGINE_DEFAULT}]: " DB_ENGINE_INPUT
+case "${DB_ENGINE_INPUT:-$DB_ENGINE_DEFAULT}" in
+    mysql)                     DB_ENGINE="mysql" ;;
+    pgsql|postgres|postgresql) DB_ENGINE="pgsql" ;;
+    *) fail "Banco de dados '${DB_ENGINE_INPUT}' não suportado — use 'mysql' ou 'pgsql'." ;;
+esac
+info "Usando '${DB_ENGINE}' como banco de dados deste projeto."
+
+if ask_yes_no "Instalar ${DB_ENGINE} em container Docker? (responda não se já usa um banco nativo no host)" "n"; then
     WANT_DB_CONTAINER=1
 else
     WANT_DB_CONTAINER=0
@@ -159,7 +178,7 @@ fi
 
 if [ "$SAIL_FRESH_INSTALL" -eq 1 ]; then
     SAIL_SERVICES=""
-    [ "$WANT_DB_CONTAINER" -eq 1 ] && SAIL_SERVICES="mysql"
+    [ "$WANT_DB_CONTAINER" -eq 1 ] && SAIL_SERVICES="${DB_ENGINE}"
     if [ "$WANT_REDIS_CONTAINER" -eq 1 ]; then
         if [ -n "$SAIL_SERVICES" ]; then
             SAIL_SERVICES="${SAIL_SERVICES},redis"
@@ -227,13 +246,58 @@ reconcile_service() {
     fi
 }
 
-reconcile_service "mysql" "$WANT_DB_CONTAINER" "DB_HOST"
+# Se o projeto já tinha o OUTRO motor configurado no compose (ex: você está
+# trocando de mysql para pgsql num projeto já existente), remove o bloco
+# antigo antes de reconciliar o motor escolhido agora.
+DB_OTHER_ENGINE="mysql"
+[ "$DB_ENGINE" = "mysql" ] && DB_OTHER_ENGINE="pgsql"
+if grep -qE "^\s{4}${DB_OTHER_ENGINE}:" "$COMPOSE_FILE" 2>/dev/null; then
+    info "Encontrei o serviço '${DB_OTHER_ENGINE}' no compose — removendo, já que você selecionou '${DB_ENGINE}' agora..."
+    reconcile_service "$DB_OTHER_ENGINE" 0 "DB_HOST"
+fi
+
+reconcile_service "$DB_ENGINE" "$WANT_DB_CONTAINER" "DB_HOST"
+
+if [ -f .env ]; then
+    if grep -q '^DB_CONNECTION=' .env; then
+        sed -i "s/^DB_CONNECTION=.*/DB_CONNECTION=${DB_ENGINE}/" .env
+    else
+        echo "DB_CONNECTION=${DB_ENGINE}" >> .env
+    fi
+    ok "DB_CONNECTION=${DB_ENGINE} configurado no .env."
+fi
+
 if [ "$WANT_DB_CONTAINER" -eq 0 ] && [ -f .env ]; then
-    warn "Confira DB_USERNAME e DB_PASSWORD no .env — eles precisam bater com as"
-    warn "credenciais do seu MySQL nativo (os valores padrão 'sail'/'password' só"
-    warn "existem no MySQL em container, não no MySQL do host)."
-    warn "Garanta também que o MySQL do host aceita conexões externas"
-    warn "(bind-address 0.0.0.0) e que o usuário tem permissão '@%' para o banco."
+    DB_BIND_HINT="bind-address 0.0.0.0 no my.cnf/mysqld.cnf, e permissão '@%' para o usuário"
+    [ "$DB_ENGINE" = "pgsql" ] && DB_BIND_HINT="listen_addresses='*' no postgresql.conf, e uma linha liberando o host em pg_hba.conf"
+
+    warn "Os valores padrão 'sail'/'password' só existem no banco em container —"
+    warn "informe as credenciais do seu ${DB_ENGINE} nativo abaixo (Enter mantém o"
+    warn "valor atual do .env)."
+    warn "Garanta também que o banco do host aceita conexões externas (${DB_BIND_HINT})."
+
+    CURRENT_DB_USERNAME="$(grep '^DB_USERNAME=' .env | head -1 | cut -d= -f2- || true)"
+    read -r -p "Usuário do banco no host (DB_USERNAME) [${CURRENT_DB_USERNAME:-sail}]: " DB_USERNAME_INPUT
+    DB_USERNAME_VALUE="${DB_USERNAME_INPUT:-${CURRENT_DB_USERNAME:-sail}}"
+    if grep -q '^DB_USERNAME=' .env; then
+        sed -i "s/^DB_USERNAME=.*/DB_USERNAME=${DB_USERNAME_VALUE}/" .env
+    else
+        echo "DB_USERNAME=${DB_USERNAME_VALUE}" >> .env
+    fi
+    ok "DB_USERNAME=${DB_USERNAME_VALUE} configurado no .env."
+
+    read -r -s -p "Senha do banco no host (DB_PASSWORD, Enter para deixar em branco): " DB_PASSWORD_INPUT
+    echo
+    if [ -n "$DB_PASSWORD_INPUT" ]; then
+        # Usa grep -v + append em vez de sed, para não ter problema com
+        # caracteres especiais (/, &, #, etc.) que a senha possa conter.
+        grep -v '^DB_PASSWORD=' .env > .env.tmp || true
+        mv .env.tmp .env
+        echo "DB_PASSWORD=${DB_PASSWORD_INPUT}" >> .env
+        ok "DB_PASSWORD configurado no .env."
+    else
+        info "Nenhuma senha informada — DB_PASSWORD não foi alterado no .env."
+    fi
 fi
 
 reconcile_service "redis" "$WANT_REDIS_CONTAINER" "REDIS_HOST"
@@ -302,13 +366,15 @@ if [ -f .env ] && { [ "$WANT_DB_CONTAINER" -eq 1 ] || [ "$WANT_REDIS_CONTAINER" 
     PORT_OFFSET=$(( $(echo "$PROJECT" | cksum | cut -d' ' -f1) % 900 ))
 
     if [ "$WANT_DB_CONTAINER" -eq 1 ]; then
-        DB_HOST_PORT="$(free_port $(( 13306 + PORT_OFFSET )))"
+        DB_PORT_BASE=13306
+        [ "$DB_ENGINE" = "pgsql" ] && DB_PORT_BASE=15432
+        DB_HOST_PORT="$(free_port $(( DB_PORT_BASE + PORT_OFFSET )))"
         if grep -q '^FORWARD_DB_PORT=' .env; then
             sed -i "s/^FORWARD_DB_PORT=.*/FORWARD_DB_PORT=${DB_HOST_PORT}/" .env
         else
             echo "FORWARD_DB_PORT=${DB_HOST_PORT}" >> .env
         fi
-        ok "FORWARD_DB_PORT=${DB_HOST_PORT} no .env (porta de host única do MySQL em container)."
+        ok "FORWARD_DB_PORT=${DB_HOST_PORT} no .env (porta de host única do ${DB_ENGINE} em container)."
     fi
 
     if [ "$WANT_REDIS_CONTAINER" -eq 1 ]; then
@@ -406,8 +472,12 @@ else
     HEURISTIC_EXT=""
     grep -qE '"(intervention/image|barryvdh/laravel-dompdf|mpdf/mpdf)"' composer.json 2>/dev/null && HEURISTIC_EXT="${HEURISTIC_EXT} gd"
     grep -qE '"(jenssegers/mongodb|mongodb/laravel-mongodb)"' composer.json 2>/dev/null && HEURISTIC_EXT="${HEURISTIC_EXT} mongodb"
+    # pdo_mysql já vem na imagem base, mas pdo_pgsql não — sem isso o Laravel
+    # não conecta de jeito nenhum num banco pgsql, então entra sempre que
+    # esse for o motor escolhido (não é uma heurística, é obrigatório).
+    [ "$DB_ENGINE" = "pgsql" ] && HEURISTIC_EXT="${HEURISTIC_EXT} pdo_pgsql pgsql"
 
-    SUGGESTED_EXTENSIONS="$(printf 'bcmath\nintl\n%s\n%s\n' "$DETECTED_EXT_FROM_COMPOSER" "$HEURISTIC_EXT" \
+    SUGGESTED_EXTENSIONS="$(printf 'bcmath\nintl\nmbstring\n%s\n%s\n' "$DETECTED_EXT_FROM_COMPOSER" "$HEURISTIC_EXT" \
         | tr -s ' ' '\n' | sed '/^$/d' | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/ *$//')"
 
     if [ -n "$DETECTED_EXT_FROM_COMPOSER$HEURISTIC_EXT" ]; then
@@ -745,7 +815,13 @@ else
 fi
 
 info "Subindo os containers (sail up -d)..."
-./vendor/bin/sail up -d
+# --remove-orphans: reconcile_service() pode ter removido mysql/redis do
+# compose.yaml (quando você opta por container->host); sem essa flag, o
+# container antigo desses serviços fica "órfão", ainda rodando à toa.
+# --force-recreate: garante que o container reflita o .env/compose.yaml que
+# o script acabou de ajustar (REDIS_HOST, WWWUSER, timezone, etc.), mesmo
+# quando o Compose não detecta mudança suficiente para recriar sozinho.
+./vendor/bin/sail up -d --remove-orphans --force-recreate
 
 # ------------------ Ferramentas de desenvolvimento (dev) --------------------
 # Rodam DEPOIS do 'up' porque tudo acontece dentro do container (sail ...).
@@ -760,6 +836,36 @@ for _ in $(seq 1 30); do
     fi
     sleep 1
 done
+
+# ------------------- composer setup (install, .env, key, migrate) ----------
+# Convenção já usada em siger/pdsait/sigait-plus: um script "setup" no
+# composer.json que roda "composer install" + garante o ".env" + gera a
+# APP_KEY + roda as migrations (e, quando há frontend, npm install/build).
+if grep -q '"setup":' composer.json; then
+    SETUP_DEFAULT="s"
+    if [ "$SAIL_FRESH_INSTALL" -eq 0 ]; then
+        # Projeto já tinha Sail configurado antes deste script rodar — não é
+        # uma instalação nova. "composer setup" roda "artisan key:generate",
+        # que troca a APP_KEY e invalida sessões/cookies e qualquer dado já
+        # criptografado com a chave atual. Default "não" para não fazer isso
+        # sem intenção explícita numa reconfiguração de projeto existente.
+        SETUP_DEFAULT="n"
+        warn "Este projeto já tinha Sail configurado — 'composer setup' roda 'artisan"
+        warn "key:generate', que troca a APP_KEY e invalida sessões/cookies e qualquer"
+        warn "dado já criptografado com a chave atual."
+    fi
+
+    SETUP_EXTRA=""
+    [ -f package.json ] && SETUP_EXTRA=", npm install/build"
+
+    if ask_yes_no "Rodar 'composer setup' agora (install, .env, key:generate, migrate --force${SETUP_EXTRA})?" "$SETUP_DEFAULT"; then
+        info "Rodando 'composer setup' dentro do container..."
+        ./vendor/bin/sail composer run-script setup
+        ok "'composer setup' concluído."
+    fi
+else
+    info "Nenhum script 'setup' em composer.json — pulando (sem essa convenção neste projeto)."
+fi
 
 # Laravel Debugbar (barryvdh/laravel-debugbar) como dependência de dev.
 if ask_yes_no "Instalar o Laravel Debugbar (--dev)?" "s"; then
