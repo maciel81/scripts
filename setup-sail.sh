@@ -265,6 +265,16 @@ if [ -f .env ]; then
         echo "DB_CONNECTION=${DB_ENGINE}" >> .env
     fi
     ok "DB_CONNECTION=${DB_ENGINE} configurado no .env."
+
+    CURRENT_DB_DATABASE="$(grep '^DB_DATABASE=' .env | head -1 | cut -d= -f2- || true)"
+    read -r -p "Nome do banco de dados (DB_DATABASE) [${CURRENT_DB_DATABASE:-laravel}]: " DB_DATABASE_INPUT
+    DB_DATABASE_VALUE="${DB_DATABASE_INPUT:-${CURRENT_DB_DATABASE:-laravel}}"
+    if grep -q '^DB_DATABASE=' .env; then
+        sed -i "s/^DB_DATABASE=.*/DB_DATABASE=${DB_DATABASE_VALUE}/" .env
+    else
+        echo "DB_DATABASE=${DB_DATABASE_VALUE}" >> .env
+    fi
+    ok "DB_DATABASE=${DB_DATABASE_VALUE} configurado no .env."
 fi
 
 if [ "$WANT_DB_CONTAINER" -eq 0 ] && [ -f .env ]; then
@@ -568,6 +578,17 @@ if grep -qE "'\\\$\{APP_PORT:-80\}:80'" "$COMPOSE_FILE"; then
     ok "Porta interna ajustada para 8080 em ${COMPOSE_FILE}."
 else
     ok "Porta interna do container já está correta."
+fi
+
+# O healthcheck do template do Sail testa localhost:80 — nessa imagem o Nginx
+# só escuta em 8080, então o healthcheck falhava sempre (unhealthy) mesmo com
+# o container respondendo normalmente.
+if grep -qE 'curl", "-f", "http://localhost:80/up' "$COMPOSE_FILE"; then
+    info "Ajustando o healthcheck para usar a porta 8080..."
+    sed -i 's#curl", "-f", "http://localhost:80/up#curl", "-f", "http://localhost:8080/up#' "$COMPOSE_FILE"
+    ok "Healthcheck ajustado para 8080 em ${COMPOSE_FILE}."
+else
+    ok "Healthcheck já aponta para a porta correta."
 fi
 
 # ------------------------------- Timezone -----------------------------------
