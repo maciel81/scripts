@@ -397,7 +397,11 @@ else
     #    foi assim que descobrimos que o pdsait precisava de "soap");
     # 2) uma pequena heurística para pacotes comuns de imagem/PDF que
     #    costumam precisar de gd/imagick sem declarar isso no composer.json.
-    DETECTED_EXT_FROM_COMPOSER="$(grep -oE '"ext-[a-z0-9_]+"' composer.json 2>/dev/null | sed -E 's/"ext-([a-z0-9_]+)"/\1/')"
+    # "|| true" no fim do pipeline: sem nenhum "ext-xxx" no composer.json, o
+    # grep não casa nada e sai com status 1 — com "pipefail" (set -euo
+    # pipefail no topo do script), isso propaga como falha da atribuição e
+    # mata o script aqui, silenciosamente (sem nenhuma mensagem de erro).
+    DETECTED_EXT_FROM_COMPOSER="$(grep -oE '"ext-[a-z0-9_]+"' composer.json 2>/dev/null | sed -E 's/"ext-([a-z0-9_]+)"/\1/' || true)"
 
     HEURISTIC_EXT=""
     grep -qE '"(intervention/image|barryvdh/laravel-dompdf|mpdf/mpdf)"' composer.json 2>/dev/null && HEURISTIC_EXT="${HEURISTIC_EXT} gd"
