@@ -121,51 +121,64 @@ case "$PHP_VERSION" in
 esac
 
 # ------------------------------ Banco de dados -------------------------------
+# Pergunta primeiro SE o projeto usa banco de dados — nem todo sistema PHP
+# legado tem um (ex: site estático com só algumas páginas dinâmicas). Só
+# entra nas perguntas de container/host/credenciais quando a resposta é sim.
 
-if ask_yes_no "Instalar MySQL em container Docker? (responda não se já usa um MySQL nativo no host)" "n"; then
-    WANT_DB_CONTAINER=1
-else
-    WANT_DB_CONTAINER=0
-fi
-
+USE_DB=0
+WANT_DB_CONTAINER=0
 DB_NAME="$PROJECT"
 DB_USER="$PROJECT"
 DB_PASSWORD=""
 DB_ROOT_PASSWORD=""
 DB_HOST_VALUE=""
 
-if [ "$WANT_DB_CONTAINER" -eq 1 ]; then
-    read -r -p "Nome do banco de dados [$DB_NAME]: " DB_NAME_INPUT
-    DB_NAME="${DB_NAME_INPUT:-$DB_NAME}"
+if ask_yes_no "Este projeto usa banco de dados (MySQL)?" "s"; then
+    USE_DB=1
 
-    read -r -p "Usuário do banco [$DB_USER]: " DB_USER_INPUT
-    DB_USER="${DB_USER_INPUT:-$DB_USER}"
+    if ask_yes_no "Instalar MySQL em container Docker? (responda não se já usa um MySQL nativo no host)" "n"; then
+        WANT_DB_CONTAINER=1
+    else
+        WANT_DB_CONTAINER=0
+    fi
 
-    read -r -s -p "Senha do usuário do banco (Enter para gerar uma aleatória): " DB_PASSWORD_INPUT
-    echo
-    DB_PASSWORD="${DB_PASSWORD_INPUT:-$(openssl rand -hex 12 2>/dev/null || date +%s | sha256sum | cut -c1-24)}"
+    if [ "$WANT_DB_CONTAINER" -eq 1 ]; then
+        read -r -p "Nome do banco de dados [$DB_NAME]: " DB_NAME_INPUT
+        DB_NAME="${DB_NAME_INPUT:-$DB_NAME}"
 
-    read -r -s -p "Senha do root do MySQL (Enter para gerar uma aleatória): " DB_ROOT_PASSWORD_INPUT
-    echo
-    DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD_INPUT:-$(openssl rand -hex 12 2>/dev/null || date +%s | sha256sum | cut -c1-24)}"
+        read -r -p "Usuário do banco [$DB_USER]: " DB_USER_INPUT
+        DB_USER="${DB_USER_INPUT:-$DB_USER}"
 
-    DB_HOST_VALUE="mysql"
+        read -r -s -p "Senha do usuário do banco (Enter para gerar uma aleatória): " DB_PASSWORD_INPUT
+        echo
+        DB_PASSWORD="${DB_PASSWORD_INPUT:-$(openssl rand -hex 12 2>/dev/null || date +%s | sha256sum | cut -c1-24)}"
+
+        read -r -s -p "Senha do root do MySQL (Enter para gerar uma aleatória): " DB_ROOT_PASSWORD_INPUT
+        echo
+        DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD_INPUT:-$(openssl rand -hex 12 2>/dev/null || date +%s | sha256sum | cut -c1-24)}"
+
+        DB_HOST_VALUE="mysql"
+    else
+        read -r -p "Endereço do MySQL (DB_HOST) — host.docker.internal se for nesta máquina, ou outro endereço [host.docker.internal]: " DB_HOST_INPUT
+        DB_HOST_VALUE="${DB_HOST_INPUT:-host.docker.internal}"
+
+        read -r -p "Nome do banco de dados a usar no MySQL do host [$DB_NAME]: " DB_NAME_INPUT
+        DB_NAME="${DB_NAME_INPUT:-$DB_NAME}"
+        read -r -p "Usuário do MySQL do host [$DB_USER]: " DB_USER_INPUT
+        DB_USER="${DB_USER_INPUT:-$DB_USER}"
+        read -r -s -p "Senha do usuário do MySQL do host: " DB_PASSWORD_INPUT
+        echo
+        DB_PASSWORD="$DB_PASSWORD_INPUT"
+
+        warn "Garanta que o MySQL do host aceita conexões externas (bind-address"
+        warn "0.0.0.0) e que o usuário '${DB_USER}' tem permissão '@%' para o banco"
+        warn "'${DB_NAME}'. Exemplo de comandos SQL:"
+        warn "  CREATE USER '${DB_USER}'@'%' IDENTIFIED BY 'sua_senha';"
+        warn "  GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'%';"
+        warn "  FLUSH PRIVILEGES;"
+    fi
 else
-    DB_HOST_VALUE="host.docker.internal"
-    read -r -p "Nome do banco de dados a usar no MySQL do host [$DB_NAME]: " DB_NAME_INPUT
-    DB_NAME="${DB_NAME_INPUT:-$DB_NAME}"
-    read -r -p "Usuário do MySQL do host [$DB_USER]: " DB_USER_INPUT
-    DB_USER="${DB_USER_INPUT:-$DB_USER}"
-    read -r -s -p "Senha do usuário do MySQL do host: " DB_PASSWORD_INPUT
-    echo
-    DB_PASSWORD="$DB_PASSWORD_INPUT"
-
-    warn "Garanta que o MySQL do host aceita conexões externas (bind-address"
-    warn "0.0.0.0) e que o usuário '${DB_USER}' tem permissão '@%' para o banco"
-    warn "'${DB_NAME}'. Exemplo de comandos SQL:"
-    warn "  CREATE USER '${DB_USER}'@'%' IDENTIFIED BY 'sua_senha';"
-    warn "  GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'%';"
-    warn "  FLUSH PRIVILEGES;"
+    info "Pulando configuração de banco de dados."
 fi
 
 # ------------------------------ Diretório docker/ ----------------------------
@@ -338,19 +351,23 @@ if [ ! -f "$ENV_FILE" ]; then
         echo "APP_PORT=8080"
         echo "WWWUSER=${WWWUSER}"
         echo "WWWGROUP=${WWWGROUP}"
-        echo "DB_HOST=${DB_HOST_VALUE}"
-        echo "DB_NAME=${DB_NAME}"
-        echo "DB_USER=${DB_USER}"
-        echo "DB_PASSWORD=${DB_PASSWORD}"
-        if [ "$WANT_DB_CONTAINER" -eq 1 ]; then
-            echo "DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}"
-            echo "FORWARD_DB_PORT=3306"
+        if [ "$USE_DB" -eq 1 ]; then
+            echo "DB_HOST=${DB_HOST_VALUE}"
+            echo "DB_NAME=${DB_NAME}"
+            echo "DB_USER=${DB_USER}"
+            echo "DB_PASSWORD=${DB_PASSWORD}"
+            if [ "$WANT_DB_CONTAINER" -eq 1 ]; then
+                echo "DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}"
+                echo "FORWARD_DB_PORT=3306"
+            fi
         fi
     } > "$ENV_FILE"
     ok "${ENV_FILE} criado."
 else
-    ok "${ENV_FILE} já existe — não sobrescrevendo. Confira manualmente se os"
-    ok "valores de DB_HOST/DB_NAME/DB_USER/DB_PASSWORD ainda fazem sentido."
+    ok "${ENV_FILE} já existe — não sobrescrevendo."
+    if [ "$USE_DB" -eq 1 ]; then
+        ok "Confira manualmente se os valores de DB_HOST/DB_NAME/DB_USER/DB_PASSWORD ainda fazem sentido."
+    fi
     if grep -q '^WWWUSER=' "$ENV_FILE"; then
         sed -i "s/^WWWUSER=.*/WWWUSER=${WWWUSER}/" "$ENV_FILE"
     else
@@ -559,31 +576,37 @@ echo
 echo "Resumo:"
 echo "  PHP:      ${PHP_VERSION} (Apache + mod_rewrite, AllowOverride All)"
 echo "  Document root: raiz do projeto (sem pasta public/)"
-if [ "$WANT_DB_CONTAINER" -eq 1 ]; then
-    echo "  MySQL:    container Docker"
-    echo "    Host (de dentro do container): mysql"
+if [ "$USE_DB" -eq 1 ]; then
+    if [ "$WANT_DB_CONTAINER" -eq 1 ]; then
+        echo "  MySQL:    container Docker"
+        echo "    Host (de dentro do container): mysql"
+    else
+        echo "  MySQL:    externo/nativo do host"
+        echo "    Host (de dentro do container): ${DB_HOST_VALUE}"
+    fi
     echo "    Banco:    ${DB_NAME}"
     echo "    Usuário:  ${DB_USER}"
     echo "    Senha:    (definida no .env, campo DB_PASSWORD)"
 else
-    echo "  MySQL:    externo/nativo do host"
-    echo "    Host (de dentro do container): host.docker.internal"
+    echo "  MySQL:    não configurado (projeto sem banco de dados)"
 fi
 echo
-echo "IMPORTANTE: este sistema não lê .env nem config.php — a app lê as"
-echo "credenciais via variável de ambiente do Apache (SetEnv no .htaccess)."
-echo "Adicione estas linhas ao .htaccess do projeto (AllowOverride All e"
-echo "mod_env já estão habilitados no container):"
-echo
-echo "  SetEnv DB_HOST \"${DB_HOST_VALUE}\""
-echo "  SetEnv DB_NAME \"${DB_NAME}\""
-echo "  SetEnv DB_USER \"${DB_USER}\""
-echo "  SetEnv DB_PASS \"${DB_PASSWORD}\""
-echo
-echo "(confira o nome exato das variáveis que o sistema espera — pode ser"
-echo "diferente de DB_HOST/DB_NAME/DB_USER/DB_PASS; procure por getenv("
-echo "no código-fonte para descobrir os nomes certos.)"
-echo
+if [ "$USE_DB" -eq 1 ]; then
+    echo "IMPORTANTE: este sistema não lê .env nem config.php — a app lê as"
+    echo "credenciais via variável de ambiente do Apache (SetEnv no .htaccess)."
+    echo "Adicione estas linhas ao .htaccess do projeto (AllowOverride All e"
+    echo "mod_env já estão habilitados no container):"
+    echo
+    echo "  SetEnv DB_HOST \"${DB_HOST_VALUE}\""
+    echo "  SetEnv DB_NAME \"${DB_NAME}\""
+    echo "  SetEnv DB_USER \"${DB_USER}\""
+    echo "  SetEnv DB_PASS \"${DB_PASSWORD}\""
+    echo
+    echo "(confira o nome exato das variáveis que o sistema espera — pode ser"
+    echo "diferente de DB_HOST/DB_NAME/DB_USER/DB_PASS; procure por getenv("
+    echo "no código-fonte para descobrir os nomes certos.)"
+    echo
+fi
 if grep -q "traefik.enable=true" docker-compose.override.yml 2>/dev/null; then
     echo "Acesse em: http://${PROJECT}.localhost"
 else

@@ -145,35 +145,76 @@ if [ ! -f compose.yaml ] && [ ! -f docker-compose.yml ]; then
     SAIL_FRESH_INSTALL=1
 fi
 
-# O banco de dados é sempre perguntado (mysql ou pgsql), independente de
-# rodar em container ou nativo no host — preenche DB_CONNECTION no .env
-# dinamicamente a partir da resposta, em vez de assumir MySQL fixo.
+# Pergunta primeiro SE o projeto usa banco de dados — só entra nas perguntas
+# de motor/container/host quando a resposta é sim. Isso evita perguntar
+# host/senha de um banco que o projeto nem vai usar.
 CURRENT_DB_CONNECTION=""
 [ -f .env ] && CURRENT_DB_CONNECTION="$(grep '^DB_CONNECTION=' .env | head -1 | cut -d= -f2- || true)"
-DB_ENGINE_DEFAULT="${CURRENT_DB_CONNECTION:-mysql}"
-case "$DB_ENGINE_DEFAULT" in
-    mysql|pgsql) ;;
-    *) DB_ENGINE_DEFAULT="mysql" ;;
-esac
 
-read -r -p "Qual banco de dados este projeto usa? (mysql/pgsql) [${DB_ENGINE_DEFAULT}]: " DB_ENGINE_INPUT
-case "${DB_ENGINE_INPUT:-$DB_ENGINE_DEFAULT}" in
-    mysql)                     DB_ENGINE="mysql" ;;
-    pgsql|postgres|postgresql) DB_ENGINE="pgsql" ;;
-    *) fail "Banco de dados '${DB_ENGINE_INPUT}' não suportado — use 'mysql' ou 'pgsql'." ;;
-esac
-info "Usando '${DB_ENGINE}' como banco de dados deste projeto."
+DB_ENGINE="none"
+WANT_DB_CONTAINER=0
+DB_HOST_VALUE=""
+if ask_yes_no "Este projeto usa banco de dados?" "s"; then
+    DB_ENGINE_DEFAULT="${CURRENT_DB_CONNECTION:-mysql}"
+    case "$DB_ENGINE_DEFAULT" in
+        mysql|pgsql|sqlite) ;;
+        *) DB_ENGINE_DEFAULT="mysql" ;;
+    esac
 
-if ask_yes_no "Instalar ${DB_ENGINE} em container Docker? (responda não se já usa um banco nativo no host)" "n"; then
-    WANT_DB_CONTAINER=1
+    read -r -p "Qual banco de dados este projeto usa? (mysql/pgsql/sqlite) [${DB_ENGINE_DEFAULT}]: " DB_ENGINE_INPUT
+    case "${DB_ENGINE_INPUT:-$DB_ENGINE_DEFAULT}" in
+        mysql)                     DB_ENGINE="mysql" ;;
+        pgsql|postgres|postgresql) DB_ENGINE="pgsql" ;;
+        sqlite)                    DB_ENGINE="sqlite" ;;
+        *) fail "Banco de dados '${DB_ENGINE_INPUT}' não suportado — use 'mysql', 'pgsql' ou 'sqlite'." ;;
+    esac
+    info "Usando '${DB_ENGINE}' como banco de dados deste projeto."
+
+    # sqlite roda como arquivo local (sem servidor) — container/host só fazem
+    # sentido pra mysql/pgsql.
+    if [ "$DB_ENGINE" = "mysql" ] || [ "$DB_ENGINE" = "pgsql" ]; then
+        if ask_yes_no "Instalar ${DB_ENGINE} em container Docker? (responda não se já usa um banco nativo no host)" "n"; then
+            WANT_DB_CONTAINER=1
+        else
+            WANT_DB_CONTAINER=0
+        fi
+
+        if [ "$WANT_DB_CONTAINER" -eq 0 ]; then
+            CURRENT_DB_HOST=""
+            [ -f .env ] && CURRENT_DB_HOST="$(grep '^DB_HOST=' .env | head -1 | cut -d= -f2- || true)"
+            DB_HOST_DEFAULT="${CURRENT_DB_HOST:-host.docker.internal}"
+            read -r -p "Endereço do banco de dados (DB_HOST) — host.docker.internal se for nesta máquina, ou outro endereço [${DB_HOST_DEFAULT}]: " DB_HOST_INPUT
+            DB_HOST_VALUE="${DB_HOST_INPUT:-$DB_HOST_DEFAULT}"
+        fi
+    fi
 else
-    WANT_DB_CONTAINER=0
+    info "Pulando configuração de banco de dados."
 fi
 
-if ask_yes_no "Instalar Redis em container Docker? (responda não se já usa um Redis nativo no host)" "n"; then
-    WANT_REDIS_CONTAINER=1
+# Mesma lógica pro Redis: só pergunta container/host/senha se o projeto de
+# fato for usar Redis.
+CURRENT_REDIS_HOST=""
+[ -f .env ] && CURRENT_REDIS_HOST="$(grep '^REDIS_HOST=' .env | head -1 | cut -d= -f2- || true)"
+
+WANT_REDIS_CONTAINER=0
+REDIS_HOST_VALUE=""
+USE_REDIS=0
+if ask_yes_no "Este projeto usa (ou vai usar) Redis?" "s"; then
+    USE_REDIS=1
+
+    if ask_yes_no "Instalar Redis em container Docker? (responda não se já usa um Redis nativo no host)" "n"; then
+        WANT_REDIS_CONTAINER=1
+    else
+        WANT_REDIS_CONTAINER=0
+    fi
+
+    if [ "$WANT_REDIS_CONTAINER" -eq 0 ]; then
+        REDIS_HOST_DEFAULT="${CURRENT_REDIS_HOST:-host.docker.internal}"
+        read -r -p "Endereço do Redis (REDIS_HOST) — host.docker.internal se for nesta máquina, ou outro endereço [${REDIS_HOST_DEFAULT}]: " REDIS_HOST_INPUT
+        REDIS_HOST_VALUE="${REDIS_HOST_INPUT:-$REDIS_HOST_DEFAULT}"
+    fi
 else
-    WANT_REDIS_CONTAINER=0
+    info "Pulando configuração de Redis."
 fi
 
 if [ "$SAIL_FRESH_INSTALL" -eq 1 ]; then
@@ -202,6 +243,7 @@ COMPOSE_FILE="compose.yaml"
 # aponta pro host se ele optou por usar a versão nativa.
 reconcile_service() {
     local service="$1" want_container="$2" host_env_var="$3"
+    local host_value="${4:-host.docker.internal}"
     local block_exists=0
 
     grep -qE "^\s{4}${service}:" "$COMPOSE_FILE" && block_exists=1
@@ -232,11 +274,11 @@ reconcile_service() {
 
         if [ -f .env ]; then
             if grep -q "^${host_env_var}=" .env; then
-                sed -i "s/^${host_env_var}=.*/${host_env_var}=host.docker.internal/" .env
+                sed -i "s/^${host_env_var}=.*/${host_env_var}=${host_value}/" .env
             else
-                echo "${host_env_var}=host.docker.internal" >> .env
+                echo "${host_env_var}=${host_value}" >> .env
             fi
-            ok "${host_env_var} ajustado para host.docker.internal no .env."
+            ok "${host_env_var} ajustado para ${host_value} no .env."
         fi
 
     elif [ "$want_container" -eq 1 ] && [ "$block_exists" -eq 1 ]; then
@@ -246,19 +288,37 @@ reconcile_service() {
     fi
 }
 
-# Se o projeto já tinha o OUTRO motor configurado no compose (ex: você está
-# trocando de mysql para pgsql num projeto já existente), remove o bloco
-# antigo antes de reconciliar o motor escolhido agora.
-DB_OTHER_ENGINE="mysql"
-[ "$DB_ENGINE" = "mysql" ] && DB_OTHER_ENGINE="pgsql"
-if grep -qE "^\s{4}${DB_OTHER_ENGINE}:" "$COMPOSE_FILE" 2>/dev/null; then
-    info "Encontrei o serviço '${DB_OTHER_ENGINE}' no compose — removendo, já que você selecionou '${DB_ENGINE}' agora..."
-    reconcile_service "$DB_OTHER_ENGINE" 0 "DB_HOST"
+# Se o projeto já tinha OUTRO motor configurado no compose (ex: você está
+# trocando de mysql para pgsql, ou de mysql para sqlite/none, num projeto já
+# existente), remove o bloco antigo antes de reconciliar o motor escolhido
+# agora.
+for DB_OTHER_ENGINE in mysql pgsql; do
+    if [ "$DB_OTHER_ENGINE" != "$DB_ENGINE" ] && grep -qE "^\s{4}${DB_OTHER_ENGINE}:" "$COMPOSE_FILE" 2>/dev/null; then
+        info "Encontrei o serviço '${DB_OTHER_ENGINE}' no compose — removendo, já que você selecionou '${DB_ENGINE}' agora..."
+        reconcile_service "$DB_OTHER_ENGINE" 0 "DB_HOST" "$DB_HOST_VALUE"
+    fi
+done
+
+if [ "$DB_ENGINE" = "mysql" ] || [ "$DB_ENGINE" = "pgsql" ]; then
+    reconcile_service "$DB_ENGINE" "$WANT_DB_CONTAINER" "DB_HOST" "$DB_HOST_VALUE"
+
+    # reconcile_service só grava DB_HOST quando remove um bloco existente do
+    # compose (transição container -> host). Numa instalação nova já optando
+    # por banco no host, esse bloco nunca existiu, então DB_HOST nunca era
+    # gravado — grava aqui de forma explícita, cobrindo os dois casos.
+    if [ "$WANT_DB_CONTAINER" -eq 0 ] && [ -n "$DB_HOST_VALUE" ] && [ -f .env ]; then
+        if grep -q '^DB_HOST=' .env; then
+            sed -i "s/^DB_HOST=.*/DB_HOST=${DB_HOST_VALUE}/" .env
+        else
+            echo "DB_HOST=${DB_HOST_VALUE}" >> .env
+        fi
+        ok "DB_HOST=${DB_HOST_VALUE} configurado no .env."
+    fi
 fi
 
-reconcile_service "$DB_ENGINE" "$WANT_DB_CONTAINER" "DB_HOST"
-
-if [ -f .env ]; then
+# "none" (sem banco) não mexe em DB_CONNECTION/DB_DATABASE — deixa o que já
+# estiver no .env (ou nada, num projeto novo) como está.
+if [ -f .env ] && [ "$DB_ENGINE" != "none" ]; then
     if grep -q '^DB_CONNECTION=' .env; then
         sed -i "s/^DB_CONNECTION=.*/DB_CONNECTION=${DB_ENGINE}/" .env
     else
@@ -266,18 +326,33 @@ if [ -f .env ]; then
     fi
     ok "DB_CONNECTION=${DB_ENGINE} configurado no .env."
 
-    CURRENT_DB_DATABASE="$(grep '^DB_DATABASE=' .env | head -1 | cut -d= -f2- || true)"
-    read -r -p "Nome do banco de dados (DB_DATABASE) [${CURRENT_DB_DATABASE:-laravel}]: " DB_DATABASE_INPUT
-    DB_DATABASE_VALUE="${DB_DATABASE_INPUT:-${CURRENT_DB_DATABASE:-laravel}}"
-    if grep -q '^DB_DATABASE=' .env; then
-        sed -i "s/^DB_DATABASE=.*/DB_DATABASE=${DB_DATABASE_VALUE}/" .env
+    if [ "$DB_ENGINE" = "sqlite" ]; then
+        SQLITE_PATH="database/database.sqlite"
+        if [ ! -f "$SQLITE_PATH" ]; then
+            mkdir -p "$(dirname "$SQLITE_PATH")"
+            touch "$SQLITE_PATH"
+            ok "Arquivo ${SQLITE_PATH} criado."
+        fi
+        if grep -q '^DB_DATABASE=' .env; then
+            sed -i "s#^DB_DATABASE=.*#DB_DATABASE=${SQLITE_PATH}#" .env
+        else
+            echo "DB_DATABASE=${SQLITE_PATH}" >> .env
+        fi
+        ok "DB_DATABASE=${SQLITE_PATH} configurado no .env."
     else
-        echo "DB_DATABASE=${DB_DATABASE_VALUE}" >> .env
+        CURRENT_DB_DATABASE="$(grep '^DB_DATABASE=' .env | head -1 | cut -d= -f2- || true)"
+        read -r -p "Nome do banco de dados (DB_DATABASE) [${CURRENT_DB_DATABASE:-laravel}]: " DB_DATABASE_INPUT
+        DB_DATABASE_VALUE="${DB_DATABASE_INPUT:-${CURRENT_DB_DATABASE:-laravel}}"
+        if grep -q '^DB_DATABASE=' .env; then
+            sed -i "s/^DB_DATABASE=.*/DB_DATABASE=${DB_DATABASE_VALUE}/" .env
+        else
+            echo "DB_DATABASE=${DB_DATABASE_VALUE}" >> .env
+        fi
+        ok "DB_DATABASE=${DB_DATABASE_VALUE} configurado no .env."
     fi
-    ok "DB_DATABASE=${DB_DATABASE_VALUE} configurado no .env."
 fi
 
-if [ "$WANT_DB_CONTAINER" -eq 0 ] && [ -f .env ]; then
+if [ "$WANT_DB_CONTAINER" -eq 0 ] && [ -f .env ] && { [ "$DB_ENGINE" = "mysql" ] || [ "$DB_ENGINE" = "pgsql" ]; }; then
     DB_BIND_HINT="bind-address 0.0.0.0 no my.cnf/mysqld.cnf, e permissão '@%' para o usuário"
     [ "$DB_ENGINE" = "pgsql" ] && DB_BIND_HINT="listen_addresses='*' no postgresql.conf, e uma linha liberando o host em pg_hba.conf"
 
@@ -310,8 +385,22 @@ if [ "$WANT_DB_CONTAINER" -eq 0 ] && [ -f .env ]; then
     fi
 fi
 
-reconcile_service "redis" "$WANT_REDIS_CONTAINER" "REDIS_HOST"
-if [ "$WANT_REDIS_CONTAINER" -eq 0 ] && [ -f .env ]; then
+reconcile_service "redis" "$WANT_REDIS_CONTAINER" "REDIS_HOST" "$REDIS_HOST_VALUE"
+
+# reconcile_service só grava REDIS_HOST quando remove um bloco existente do
+# compose (transição container -> host). Numa instalação nova já optando por
+# Redis no host, esse bloco nunca existiu, então REDIS_HOST nunca era
+# gravado — grava aqui de forma explícita, cobrindo os dois casos.
+if [ "$WANT_REDIS_CONTAINER" -eq 0 ] && [ -n "$REDIS_HOST_VALUE" ] && [ -f .env ]; then
+    if grep -q '^REDIS_HOST=' .env; then
+        sed -i "s/^REDIS_HOST=.*/REDIS_HOST=${REDIS_HOST_VALUE}/" .env
+    else
+        echo "REDIS_HOST=${REDIS_HOST_VALUE}" >> .env
+    fi
+    ok "REDIS_HOST=${REDIS_HOST_VALUE} configurado no .env."
+fi
+
+if [ "$USE_REDIS" -eq 1 ] && [ "$WANT_REDIS_CONTAINER" -eq 0 ] && [ -f .env ]; then
     warn "Garanta que o Redis do host aceita conexões externas (bind 0.0.0.0 em"
     warn "redis.conf) — sem isso, o Redis recusa conexões vindas do container"
     warn "(modo protegido / protected-mode)."
