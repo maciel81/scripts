@@ -512,30 +512,46 @@ else
     warn ".env não encontrado — configure APP_SERVICE=${SERVICE_NAME} manualmente depois."
 fi
 
-# ------------------------- Publicar Dockerfiles do Sail ----------------------
-
-if [ ! -d docker ]; then
-    info "Publicando Dockerfiles do Sail (php artisan sail:publish)..."
-    php artisan sail:publish
-else
-    ok "Pasta docker/ já existe (Dockerfiles já publicados)."
-fi
-
-# Detecta a pasta correta lendo o "context:" de build do PRÓPRIO serviço da
-# aplicação no compose.yaml (não adivinha por ordenação de pastas, já que o
-# Sail também cria pastas como docker/pgsql, docker/mysql etc. só com scripts
-# de inicialização de banco, sem Dockerfile — mesmo que você não use esses
-# bancos).
-PHP_DIR="$(
+# --------------------- Diretório local de build (PHP) ------------------------
+# O "sail:install"/"sail:add" apontam o build context e os volumes de banco do
+# compose.yaml para dentro do vendor (./vendor/laravel/sail/runtimes/X e
+# ./vendor/laravel/sail/database/{mysql,pgsql,mariadb}/...) — funciona (é o
+# Sail "de fábrica"), mas some no próximo "composer install"/update.
+#
+# A alternativa óbvia seria "php artisan sail:publish", só que esse comando
+# não recebe lista nenhuma: ele sempre copia a árvore INTEIRA de stubs do
+# pacote — um Dockerfile por versão de PHP suportada (8.0, 8.1, 8.2...) e a
+# pasta de init de TODO banco suportado (mysql, mariadb, pgsql) — não só o que
+# este projeto usa (foi assim que docker/8.0-8.4 e docker/mysql/mariadb/pgsql
+# foram parar no sigait-plus, sem nunca serem referenciados pelo compose.yaml).
+#
+# Como o Dockerfile é reescrito do zero logo abaixo de qualquer forma, não há
+# motivo pra publicar o da Sail só pra descartá-lo em seguida: criamos a pasta
+# local nós mesmos e redirecionamos só a linha "context:" do serviço da
+# aplicação pra ela. O volume de init do banco em container (quando usado)
+# continua apontando pro vendor — não precisamos de cópia local dele, já que
+# não mexemos nesse arquivo.
+PHP_DIR_FROM_COMPOSE="$(
     sed -n "/^\s\{4\}${SERVICE_NAME}:/,/^\s\{4\}[a-zA-Z0-9_.-]\+:/p" "$COMPOSE_FILE" \
         | grep -m1 "context:" \
         | sed -E "s/.*context: *['\"]?\.\/([^'\"[:space:]]+)['\"]?.*/\1/"
 )"
 
-if [ -z "$PHP_DIR" ] || [ ! -f "${PHP_DIR}/Dockerfile" ]; then
-    fail "Não consegui identificar a pasta de build correta a partir de '${COMPOSE_FILE}'. Confira manualmente a linha 'context:' dentro do serviço '${SERVICE_NAME}' e rode 'php artisan sail:publish' se ainda não publicou os Dockerfiles."
+[ -z "$PHP_DIR_FROM_COMPOSE" ] && \
+    fail "Não consegui identificar a linha 'context:' do serviço '${SERVICE_NAME}' em ${COMPOSE_FILE}. Confira manualmente."
+
+PHP_VERSION="$(basename "$PHP_DIR_FROM_COMPOSE")"
+PHP_DIR="docker/${PHP_VERSION}"
+
+if [ "$PHP_DIR_FROM_COMPOSE" != "$PHP_DIR" ]; then
+    info "Redirecionando o build context de '${SERVICE_NAME}' de '${PHP_DIR_FROM_COMPOSE}' (vendor) para '${PHP_DIR}' (local)..."
+    sed -i -E "s#(context: *)['\"]?\./${PHP_DIR_FROM_COMPOSE}['\"]?#\1'./${PHP_DIR}'#" "$COMPOSE_FILE"
+    ok "Build context ajustado para ${PHP_DIR} em ${COMPOSE_FILE}."
+else
+    ok "Build context já aponta para ${PHP_DIR}."
 fi
 
+mkdir -p "$PHP_DIR"
 DOCKERFILE="${PHP_DIR}/Dockerfile"
 
 info "Usando Dockerfiles em: ${PHP_DIR}"
@@ -544,13 +560,11 @@ NEEDS_REBUILD=0
 
 # ------------- Runtime PHP: serversideup/php (Alpine + FPM + Nginx) ---------
 # Substitui o Dockerfile padrão do Sail (Ubuntu + "php artisan serve" +
-# Supervisor) publicado acima por um baseado em serversideup/php: imagem
-# menor (Alpine), só as extensões que o projeto realmente usa, e Nginx+PHP-FPM
-# nativos em vez do servidor de desenvolvimento do PHP. Ver
+# Supervisor) por um baseado em serversideup/php: imagem menor (Alpine), só as
+# extensões que o projeto realmente usa, e Nginx+PHP-FPM nativos em vez do
+# servidor de desenvolvimento do PHP. Ver
 # documentacao/projetos/multas/pdsait/infraestrutura/docker.md para o
 # histórico completo dessa decisão.
-
-PHP_VERSION="$(basename "$PHP_DIR")"
 
 if grep -q "FROM serversideup/php:" "$DOCKERFILE" 2>/dev/null; then
     ok "Dockerfile já está no runtime serversideup/php — pulando geração."
