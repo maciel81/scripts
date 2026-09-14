@@ -45,7 +45,7 @@ encode_path() {
 resolve_project_path() {
   local name="$1"
   local matches
-  matches="$(find "$CODE_BASE" -maxdepth 3 -type d \
+  matches="$(find "$CODE_BASE" -maxdepth 2 -type d \
     \( -name node_modules -o -name vendor -o -name .git -o -path "$MEMORY_REPO" \) -prune \
     -o -type d -name "$name" -print 2>/dev/null)"
 
